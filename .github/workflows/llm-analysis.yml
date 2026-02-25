@@ -1,0 +1,129 @@
+name: LLM Code Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Analysis mode'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto     # Build+test, analyze only if failures/warnings
+          - review   # Always run LLM code review on recent changes
+      repository:
+        description: 'Target repository (owner/repo)'
+        required: true
+        type: string
+      ref:
+        description: 'Branch or tag to analyze (default: main)'
+        required: false
+        default: 'main'
+        type: string
+      build_cmd:
+        description: 'Build command (default: cmake workflow)'
+        required: false
+        type: string
+      test_cmd:
+        description: 'Test command (default: ctest)'
+        required: false
+        type: string
+      build_setup_cmd:
+        description: 'Setup command run before build (e.g. apt-get install ...)'
+        required: false
+        type: string
+      system_prompt:
+        description: 'Custom LLM system prompt'
+        required: false
+        type: string
+
+concurrency:
+  group: llm-analysis
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repository }}
+          ref: ${{ github.event.inputs.ref }}
+          path: target-repo
+          fetch-depth: 2
+
+      - name: Build analysis image
+        run: docker build -t code-llm .
+
+      - name: Run analysis
+        id: analysis
+        env:
+          BUILD_CMD: ${{ github.event.inputs.build_cmd }}
+          TEST_CMD: ${{ github.event.inputs.test_cmd }}
+          BUILD_SETUP_CMD: ${{ github.event.inputs.build_setup_cmd }}
+          SYSTEM_PROMPT: ${{ github.event.inputs.system_prompt }}
+        run: |
+          docker run --rm \
+            -e BUILD_CMD \
+            -e TEST_CMD \
+            -e BUILD_SETUP_CMD \
+            -e SYSTEM_PROMPT \
+            -v "${{ github.workspace }}/target-repo:/workspace" \
+            code-llm "${{ github.event.inputs.mode }}" \
+            | tee analysis.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+          # Parse structured output from the container
+          if grep -q '^ISSUE_TITLE=' analysis.log; then
+            grep '^ISSUE_TITLE=' analysis.log | head -1 >> "$GITHUB_OUTPUT"
+            sed -n '/^ISSUE_BODY<<EOF$/,/^EOF$/{ /^ISSUE_BODY<<EOF$/d; /^EOF$/d; p; }' analysis.log > issue_body.md
+            echo "has_issue=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_issue=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue for errors
+        if: steps.analysis.outputs.has_issue == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const title = `${{ steps.analysis.outputs.ISSUE_TITLE }}`;
+            const body = fs.readFileSync('issue_body.md', 'utf8');
+
+            // Avoid duplicate issues
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'llm-analysis',
+              per_page: 20,
+            });
+            const dup = existing.find(i => i.title === title);
+            if (dup) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: dup.number,
+                body: `Updated analysis (${new Date().toISOString()}):\n\n${body}`,
+              });
+              console.log(`Updated existing issue #${dup.number}`);
+              return;
+            }
+
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['llm-analysis'],
+            });
+            console.log(`Created issue #${issue.number}`);
